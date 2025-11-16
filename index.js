@@ -1,12 +1,19 @@
+// index.js
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 const Stripe = require("stripe");
+const {
+  initDb,
+  upsertMapping,
+  getActiveMappings,
+  getAllMappings,
+} = require("./db");
 
 const app = express();
 
-// --- Config from .env ---
+// ---- ENV CONFIG ----
 const {
   PORT = 3000,
   STRIPE_SECRET_KEY,
@@ -18,12 +25,17 @@ const {
   USAGE_JOB_SECRET,
 } = process.env;
 
+if (!STRIPE_SECRET_KEY) console.warn("⚠ STRIPE_SECRET_KEY not set");
+if (!STRIPE_WEBHOOK_SECRET) console.warn("⚠ STRIPE_WEBHOOK_SECRET not set");
+if (!STRIPE_METER_EVENT_NAME) console.warn("⚠ STRIPE_METER_EVENT_NAME not set");
+if (!TOGGL_API_TOKEN) console.warn("⚠ TOGGL_API_TOKEN not set");
+if (!TOGGL_WORKSPACE_ID) console.warn("⚠ TOGGL_WORKSPACE_ID not set");
+if (!TODOIST_API_TOKEN) console.warn("⚠ TODOIST_API_TOKEN not set");
+if (!USAGE_JOB_SECRET) console.warn("⚠ USAGE_JOB_SECRET not set");
+
 const stripe = Stripe(STRIPE_SECRET_KEY);
 
-// In-memory "DB" for now (replace with Postgres later)
-const customerMappings = [];
-
-// For Stripe webhooks we need raw body
+// ---------- STRIPE WEBHOOK (RAW BODY) ----------
 app.post(
   "/webhooks/stripe",
   bodyParser.raw({ type: "application/json" }),
@@ -37,37 +49,82 @@ app.post(
         sig,
         STRIPE_WEBHOOK_SECRET
       );
+      console.log("✅ Stripe webhook received:", event.type);
     } catch (err) {
-      console.error("⚠️  Webhook signature verification failed.", err.message);
+      console.error("❌ Webhook signature verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // We care about subscription-related events
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-
-      try {
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
         await handleCheckoutSessionCompleted(session);
-      } catch (err) {
-        console.error("Error handling checkout.session.completed:", err);
-        return res.status(500).send("Webhook handler error");
       }
-    }
 
-    res.json({ received: true });
+      res.json({ received: true });
+    } catch (err) {
+      console.error("❌ Error handling Stripe webhook:", err);
+      res.status(500).send("Webhook handler error");
+    }
   }
 );
 
-// Toggl + Todoist + mapping logic for new subscription
+// ---------- JSON BODY FOR EVERYTHING ELSE ----------
+app.use(bodyParser.json());
+
+// Healthcheck
+app.get("/", (req, res) => {
+  res.send("Stripe–Toggl–Todoist microservice is running.");
+});
+
+// Debug endpoint: list mappings (protect with a secret in real life)
+app.get("/admin/mappings", async (req, res) => {
+  const rows = await getAllMappings();
+  res.json(rows);
+});
+
+// Cron job endpoint – called by Render cron
+app.post("/jobs/sync-usage", async (req, res) => {
+  const { secret } = req.query;
+  if (!secret || secret !== USAGE_JOB_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    console.log("🔁 Running usage sync job...");
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startIso = startOfMonth.toISOString();
+    const endIso = now.toISOString();
+
+    const mappings = await getActiveMappings();
+    console.log(`   → Found ${mappings.length} active mappings`);
+
+    let processed = 0;
+    for (const mapping of mappings) {
+      await syncUsageForMapping(mapping, startIso, endIso);
+      processed++;
+    }
+
+    res.json({ status: "ok", synced: processed });
+  } catch (err) {
+    console.error("❌ Error in sync-usage job:", err);
+    res.status(500).json({ error: "Job failed" });
+  }
+});
+
+// ---------- HANDLER: checkout.session.completed ----------
+
 async function handleCheckoutSessionCompleted(session) {
   const customerId = session.customer;
   const subscriptionId = session.subscription;
-  const priceId =
-    session.metadata && session.metadata.price_id
-      ? session.metadata.price_id
-      : null;
 
-  // Fetch full customer to get company / name
+  console.log(
+    `🧾 checkout.session.completed for customer ${customerId}, subscription ${subscriptionId}`
+  );
+
+  // 1) Fetch full customer data from Stripe
   const customer = await stripe.customers.retrieve(customerId);
 
   const companyName =
@@ -76,46 +133,40 @@ async function handleCheckoutSessionCompleted(session) {
     session.metadata?.company_name ||
     "Unknown Company";
 
-  // You can derive plan from line_items on the subscription if needed
-  // For now we'll just store priceId as "planName"
-  const planName = priceId || "Unknown Plan";
+  const planName =
+    session.metadata?.plan_name ||
+    (session.mode === "subscription" && session.display_items
+      ? "Subscription"
+      : "Unknown Plan");
 
-  const baseProjectName = `${companyName} – Website Support (${planName})`;
+  const projectName = `${companyName} – Website Support (${planName})`;
 
-  console.log("Creating Toggl client/project for:", baseProjectName);
+  console.log("🧱 Creating Toggl client/project for:", projectName);
 
-  // 1) Create Toggl Client
+  // 2) Create Toggl Client + Project
   const togglClientId = await createTogglClient(companyName);
+  const togglProjectId = await createTogglProject(projectName, togglClientId);
 
-  // 2) Create Toggl Project
-  const togglProjectId = await createTogglProject(
-    baseProjectName,
-    togglClientId
-  );
-
-  console.log("Creating Todoist project for:", baseProjectName);
+  console.log("📁 Creating Todoist project for:", projectName);
 
   // 3) Create Todoist Project
-  const todoistProjectId = await createTodoistProject(baseProjectName);
+  const todoistProjectId = await createTodoistProject(projectName);
 
-  // 4) Save mapping in memory
-  const mapping = {
-    stripeCustomerId: customerId,
-    stripeSubscriptionId: subscriptionId,
-    companyName,
-    planName,
-    togglClientId,
-    togglProjectId,
-    todoistProjectId,
-    lastUsageSyncAt: null,
-  };
+  // 4) Save mapping in Postgres
+  const mapping = await upsertMapping({
+    stripe_customer_id: customerId,
+    stripe_subscription_id: subscriptionId,
+    company_name: companyName,
+    plan_name: planName,
+    toggl_client_id: togglClientId,
+    toggl_project_id: togglProjectId,
+    todoist_project_id: todoistProjectId,
+  });
 
-  customerMappings.push(mapping);
-
-  console.log("Mapping stored:", mapping);
+  console.log("✅ Mapping stored in DB:", mapping);
 }
 
-// --- Toggl helpers ---
+// ---------- TOGGL HELPERS ----------
 
 async function createTogglClient(name) {
   const url = `https://api.track.toggl.com/api/v9/workspaces/${TOGGL_WORKSPACE_ID}/clients`;
@@ -131,6 +182,7 @@ async function createTogglClient(name) {
     }
   );
 
+  console.log("   → Toggl client created with id:", res.data.id);
   return res.data.id;
 }
 
@@ -153,10 +205,11 @@ async function createTogglProject(projectName, clientId) {
     }
   );
 
+  console.log("   → Toggl project created with id:", res.data.id);
   return res.data.id;
 }
 
-// --- Todoist helper ---
+// ---------- TODOIST HELPER ----------
 
 async function createTodoistProject(projectName) {
   const url = "https://api.todoist.com/rest/v2/projects";
@@ -172,51 +225,25 @@ async function createTodoistProject(projectName) {
     }
   );
 
+  console.log("   → Todoist project created with id:", res.data.id);
   return res.data.id;
 }
 
-// --- Usage sync job endpoint ---
-// Render cron or any scheduler can POST here with ?secret=...
-
-app.post("/jobs/sync-usage", express.json(), async (req, res) => {
-  const { secret } = req.query;
-  if (!secret || secret !== USAGE_JOB_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  try {
-    // For now, just sync for all mappings using current month as window
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const startIso = startOfMonth.toISOString();
-    const endIso = now.toISOString();
-
-    for (const mapping of customerMappings) {
-      await syncUsageForMapping(mapping, startIso, endIso);
-    }
-
-    res.json({ status: "ok", synced: customerMappings.length });
-  } catch (err) {
-    console.error("Error in sync-usage job:", err);
-    res.status(500).json({ error: "Job failed" });
-  }
-});
+// ---------- USAGE SYNC LOGIC ----------
 
 async function syncUsageForMapping(mapping, startIso, endIso) {
   console.log(
-    `Syncing usage for ${mapping.companyName} (${mapping.stripeCustomerId})`
+    `⏱ Syncing usage for ${mapping.company_name} (${mapping.stripe_customer_id})`
   );
 
   const timeEntries = await fetchTogglTimeEntries(
-    mapping.togglProjectId,
+    mapping.toggl_project_id,
     startIso,
     endIso
   );
 
   const totalSeconds = timeEntries.reduce((sum, e) => {
-    if (e.billable && e.duration > 0) {
-      return sum + e.duration;
-    }
+    if (e.billable && e.duration > 0) return sum + e.duration;
     return sum;
   }, 0);
 
@@ -224,25 +251,24 @@ async function syncUsageForMapping(mapping, startIso, endIso) {
   const hoursRounded = Number(hours.toFixed(2));
 
   console.log(
-    `Total billable seconds: ${totalSeconds}, hours: ${hoursRounded}`
+    `   → Total billable seconds: ${totalSeconds}, hours: ${hoursRounded}`
   );
 
   if (hoursRounded <= 0) {
-    console.log("No hours to report. Skipping Stripe meter event.");
+    console.log("   → No hours to report. Skipping Stripe meter event.");
     return;
   }
 
-  // Send usage to Stripe meter
   await stripe.billing.meterEvents.create({
     event_name: STRIPE_METER_EVENT_NAME,
     payload: {
-      stripe_customer_id: mapping.stripeCustomerId,
+      stripe_customer_id: mapping.stripe_customer_id,
       value: hoursRounded,
-      project_id: mapping.togglProjectId.toString(),
+      project_id: mapping.toggl_project_id.toString(),
     },
   });
 
-  console.log("Stripe meter event sent with value:", hoursRounded);
+  console.log("   → Stripe meter event sent with value:", hoursRounded);
 }
 
 async function fetchTogglTimeEntries(projectId, startIso, endIso) {
@@ -258,19 +284,19 @@ async function fetchTogglTimeEntries(projectId, startIso, endIso) {
   });
 
   const allEntries = res.data;
-
-  // Only entries from this project
   return allEntries.filter((e) => e.project_id === projectId);
 }
 
-// --- Healthcheck ---
+// ---------- START SERVER ----------
+(async () => {
+  try {
+    await initDb();
+    app.listen(PORT, () => {
+      console.log(`🚀 Server listening on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error("❌ Failed to init DB:", err);
+    process.exit(1);
+  }
+})();
 
-app.get("/", (req, res) => {
-  res.send("Stripe–Toggl–Todoist microservice is running.");
-});
-
-// --- Start server ---
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
