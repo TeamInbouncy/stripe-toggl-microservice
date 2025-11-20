@@ -1534,7 +1534,7 @@ async function findOrCreateTodoistProject(projectName) {
   }
 }
 
-// ---------- FIXED: Usage sync job with Real-time Updates ----------
+// ---------- FIXED: Usage sync job with CORRECT Stripe format ----------
 
 app.post('/jobs/sync-usage', async (req, res) => {
   console.log('\n🎯 [SYNC] Sync job started');
@@ -1572,8 +1572,8 @@ app.post('/jobs/sync-usage', async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      // FIXED: Look back only 1 hour for real-time updates (instead of 7 days)
-      const since = mapping.last_synced_at || new Date(now.getTime() - 1 * 60 * 60 * 1000);
+      // Look back 7 days to catch all time entries
+      const since = mapping.last_synced_at || new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
       console.log(`⏰ [SYNC] Time range: ${since.toISOString()} to ${now.toISOString()}`);
 
       const totalSeconds = await fetchTogglBillableSecondsForProject(
@@ -1593,10 +1593,10 @@ app.post('/jobs/sync-usage', async (req, res) => {
       try {
         console.log(`📤 [SYNC] Sending ${hours.toFixed(2)}h to Stripe...`);
         
-        // FIXED: Use correct Stripe meter event format
+        // CRITICAL FIX: Use stripe_customer_id instead of customer_id
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[customer_id]', mapping.stripe_customer_id); // FIXED: Remove 'stripe_' prefix
+        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id); // FIXED
         form.append('payload[value]', hours.toFixed(2));
 
         console.log('📦 [SYNC] Stripe payload:');
@@ -1629,12 +1629,6 @@ app.post('/jobs/sync-usage', async (req, res) => {
         console.error('❌ [SYNC] Stripe API error:');
         console.error('🔴 [SYNC] Status:', stripeErr.response?.status);
         console.error('🔴 [SYNC] Data:', stripeErr.response?.data);
-        
-        // If it's a meter event error, try with different payload format
-        if (stripeErr.response?.status === 400) {
-          console.log('🔄 [SYNC] Trying alternative meter event format...');
-          await sendMeterEventAlternative(mapping.stripe_customer_id, hours);
-        }
       }
     }
 
@@ -1646,40 +1640,6 @@ app.post('/jobs/sync-usage', async (req, res) => {
     res.status(500).json({ error: 'Sync job failed' });
   }
 });
-
-// ---------- Alternative Meter Event Function ----------
-
-async function sendMeterEventAlternative(customerId, hours) {
-  try {
-    console.log(`🔄 [ALTERNATIVE] Trying alternative meter event format for ${hours}h`);
-    
-    // Alternative 1: Simple customer_id format
-    const form = new URLSearchParams();
-    form.append('event_name', STRIPE_METER_EVENT_NAME);
-    form.append('payload[customer_id]', customerId);
-    form.append('payload[value]', hours.toFixed(2));
-
-    const response = await axios.post(
-      'https://api.stripe.com/v1/billing/meter_events',
-      form.toString(),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        auth: {
-          username: process.env.STRIPE_SECRET_KEY,
-          password: '',
-        },
-      }
-    );
-
-    console.log('✅ [ALTERNATIVE] Success with alternative format');
-    return response.data;
-  } catch (err) {
-    console.error('❌ [ALTERNATIVE] Failed:', err.response?.data);
-    throw err;
-  }
-}
 
 // ---------- Manual fix endpoint for existing subscriptions ----------
 
@@ -1738,7 +1698,7 @@ app.post('/sync-customer', async (req, res) => {
     });
 
     const now = new Date();
-    const since = mapping.last_synced_at || new Date(now.getTime() - 1 * 60 * 60 * 1000); // 1 hour
+    const since = mapping.last_synced_at || new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days
     
     console.log(`⏰ [REAL-TIME] Sync range: ${since.toISOString()} to ${now.toISOString()}`);
 
@@ -1768,9 +1728,10 @@ app.post('/sync-customer', async (req, res) => {
     // Send to Stripe
     console.log(`📤 [REAL-TIME] Sending ${calculatedHours.toFixed(2)}h to Stripe...`);
     
+    // CRITICAL FIX: Use stripe_customer_id instead of customer_id
     const form = new URLSearchParams();
     form.append('event_name', STRIPE_METER_EVENT_NAME);
-    form.append('payload[customer_id]', customer_id);
+    form.append('payload[stripe_customer_id]', customer_id); // FIXED
     form.append('payload[value]', calculatedHours.toFixed(2));
 
     const stripeResponse = await axios.post(
@@ -1812,37 +1773,6 @@ app.post('/sync-customer', async (req, res) => {
   }
 });
 
-// ---------- Debug endpoint to test meter events ----------
-
-app.post('/debug/meter-events', async (req, res) => {
-  console.log('\n🐛 [DEBUG-METER] Checking meter events');
-  
-  if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
-    console.error('❌ [DEBUG-METER] Unauthorized');
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { customer_id = 'cus_TSRkPFKqd8TM00' } = req.body;
-
-  try {
-    // List recent meter events for a customer
-    const events = await stripe.billing.meterEvents.list({
-      limit: 10,
-      customer: customer_id
-    });
-    
-    console.log('📊 [DEBUG-METER] Recent meter events:', events.data);
-    
-    res.json({
-      events: events.data,
-      total: events.data.length
-    });
-  } catch (err) {
-    console.error('❌ [DEBUG-METER] Error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ---------- Test meter event submission ----------
 
 app.post('/test-meter-event', async (req, res) => {
@@ -1862,9 +1792,10 @@ app.post('/test-meter-event', async (req, res) => {
   try {
     console.log(`🧪 [TEST-METER] Sending test event: ${hours}h for customer ${customer_id}`);
     
+    // CRITICAL FIX: Use stripe_customer_id instead of customer_id
     const form = new URLSearchParams();
     form.append('event_name', event_name);
-    form.append('payload[customer_id]', customer_id);
+    form.append('payload[stripe_customer_id]', customer_id); // FIXED
     form.append('payload[value]', hours.toString());
 
     const response = await axios.post(
@@ -1890,6 +1821,81 @@ app.post('/test-meter-event', async (req, res) => {
   }
 });
 
+// ---------- Debug endpoint to check Toggl projects ----------
+
+app.post('/debug/toggl-projects', async (req, res) => {
+  console.log('\n🐛 [DEBUG-TOGGL] Checking Toggl projects');
+  
+  if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
+    console.error('❌ [DEBUG-TOGGL] Unauthorized');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const projects = await togglApi.get(`/workspaces/${TOGGL_WORKSPACE_ID}/projects`);
+    
+    console.log(`📊 [DEBUG-TOGGL] Found ${projects.data?.length || 0} projects`);
+    
+    // Show projects with their IDs and client names
+    const projectList = projects.data.map(p => ({
+      id: p.id,
+      name: p.name,
+      client_id: p.client_id,
+      active: p.active,
+      billable: p.billable
+    }));
+    
+    res.json({
+      total: projects.data.length,
+      projects: projectList
+    });
+  } catch (err) {
+    console.error('❌ [DEBUG-TOGGL] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Debug endpoint to check Toggl time entries ----------
+
+app.post('/debug/toggl-time', async (req, res) => {
+  console.log('\n🐛 [DEBUG-TOGGL-TIME] Checking Toggl time entries');
+  
+  if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
+    console.error('❌ [DEBUG-TOGGL-TIME] Unauthorized');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { project_id, days = 7 } = req.body;
+  
+  if (!project_id) {
+    return res.status(400).json({ error: 'Missing project_id' });
+  }
+
+  try {
+    const now = new Date();
+    const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    
+    console.log(`🔍 [DEBUG-TOGGL-TIME] Checking project ${project_id} from ${since.toISOString()} to ${now.toISOString()}`);
+    
+    const totalSeconds = await fetchTogglBillableSecondsForProject(project_id, since, now);
+    const hours = totalSeconds / 3600;
+    
+    res.json({
+      project_id: project_id,
+      time_range: {
+        since: since.toISOString(),
+        until: now.toISOString(),
+        days: days
+      },
+      hours: hours.toFixed(2),
+      found_entries: hours > 0
+    });
+  } catch (err) {
+    console.error('❌ [DEBUG-TOGGL-TIME] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------- Force sync endpoint (ignores last_synced) ----------
 
 app.post('/force-sync', async (req, res) => {
@@ -1900,7 +1906,7 @@ app.post('/force-sync', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { days = 1 } = req.body; // Default to 1 day back for real-time
+  const { days = 7 } = req.body; // Default to 7 days back
 
   try {
     const mappings = await getAllMappings();
@@ -1943,9 +1949,10 @@ app.post('/force-sync', async (req, res) => {
       try {
         console.log(`📤 [FORCE-SYNC] Sending ${hours.toFixed(2)}h to Stripe...`);
         
+        // CRITICAL FIX: Use stripe_customer_id instead of customer_id
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[customer_id]', mapping.stripe_customer_id);
+        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id); // FIXED
         form.append('payload[value]', hours.toFixed(2));
 
         await axios.post(
