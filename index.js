@@ -988,8 +988,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 const USAGE_JOB_SECRET = process.env.USAGE_JOB_SECRET;
 const TOGGL_WORKSPACE_ID = process.env.TOGGL_WORKSPACE_ID;
 const TODOIST_WORKSPACE_ID = process.env.TODOIST_WORKSPACE_ID;
-const STRIPE_METER_EVENT_NAME =
-  process.env.STRIPE_METER_EVENT_NAME || 'billable_hours';
+const STRIPE_METER_EVENT_NAME = process.env.STRIPE_METER_EVENT_NAME || 'billable_hours';
 
 console.log('🔧 [CONFIG] Environment check:');
 console.log('   - TOGGL_WORKSPACE_ID:', TOGGL_WORKSPACE_ID);
@@ -1426,7 +1425,7 @@ async function findOrCreateTogglProject(clientId, projectName) {
   }
 }
 
-// ---------- FIXED: Toggl Time Entry Function ----------
+// ---------- FIXED: Toggl Time Entry Function with Rate Limiting ----------
 
 async function fetchTogglBillableSecondsForProject(projectId, since, until) {
   console.log('\n🔍 [TOGGL-TIME] Fetching time entries');
@@ -1434,10 +1433,13 @@ async function fetchTogglBillableSecondsForProject(projectId, since, until) {
   console.log('⏰ [TOGGL-TIME] Since:', since.toISOString());
   console.log('⏰ [TOGGL-TIME] Until:', until.toISOString());
 
+  // Add delay to avoid rate limits
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
   const params = {
     start_date: since.toISOString(),
     end_date: until.toISOString(),
-    project_ids: parseInt(projectId) // CRITICAL FIX: Filter by project server-side
+    project_ids: parseInt(projectId)
   };
 
   try {
@@ -1480,6 +1482,12 @@ async function fetchTogglBillableSecondsForProject(projectId, since, until) {
     return totalSeconds;
 
   } catch (err) {
+    if (err.response?.status === 402) {
+      console.error('❌ [TOGGL-TIME] RATE LIMIT HIT - Toggl API quota exceeded');
+      console.error('⏰ [TOGGL-TIME] Please wait or upgrade Toggl plan');
+      return 0;
+    }
+    
     console.error('❌ [TOGGL-TIME] Error fetching time entries:');
     console.error('🔴 [TOGGL-TIME] Status:', err.response?.status);
     console.error('🔴 [TOGGL-TIME] Data:', err.response?.data);
@@ -1526,7 +1534,7 @@ async function findOrCreateTodoistProject(projectName) {
   }
 }
 
-// ---------- FIXED: Usage sync job (Render Cron) ----------
+// ---------- FIXED: Usage sync job with Real-time Updates ----------
 
 app.post('/jobs/sync-usage', async (req, res) => {
   console.log('\n🎯 [SYNC] Sync job started');
@@ -1558,8 +1566,14 @@ app.post('/jobs/sync-usage', async (req, res) => {
       console.log('   - Toggl Project ID:', mapping.toggl_project_id);
       console.log('   - Last Synced:', mapping.last_synced_at);
 
-      // FIXED: Extend default range from 24 hours to 7 days
-      const since = mapping.last_synced_at || new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      // Add delay between API calls to avoid rate limits
+      if (mappings.indexOf(mapping) > 0) {
+        console.log('⏳ [SYNC] Adding 2-second delay to avoid rate limits...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+
+      // FIXED: Look back only 1 hour for real-time updates (instead of 7 days)
+      const since = mapping.last_synced_at || new Date(now.getTime() - 1 * 60 * 60 * 1000);
       console.log(`⏰ [SYNC] Time range: ${since.toISOString()} to ${now.toISOString()}`);
 
       const totalSeconds = await fetchTogglBillableSecondsForProject(
@@ -1579,17 +1593,16 @@ app.post('/jobs/sync-usage', async (req, res) => {
       try {
         console.log(`📤 [SYNC] Sending ${hours.toFixed(2)}h to Stripe...`);
         
+        // FIXED: Use correct Stripe meter event format
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id);
+        form.append('payload[customer_id]', mapping.stripe_customer_id); // FIXED: Remove 'stripe_' prefix
         form.append('payload[value]', hours.toFixed(2));
-        form.append('payload[project_id]', String(mapping.toggl_project_id));
 
         console.log('📦 [SYNC] Stripe payload:');
         console.log('   - Event:', STRIPE_METER_EVENT_NAME);
         console.log('   - Customer:', mapping.stripe_customer_id);
         console.log('   - Hours:', hours.toFixed(2));
-        console.log('   - Project ID:', mapping.toggl_project_id);
 
         const stripeResponse = await axios.post(
           'https://api.stripe.com/v1/billing/meter_events',
@@ -1616,6 +1629,12 @@ app.post('/jobs/sync-usage', async (req, res) => {
         console.error('❌ [SYNC] Stripe API error:');
         console.error('🔴 [SYNC] Status:', stripeErr.response?.status);
         console.error('🔴 [SYNC] Data:', stripeErr.response?.data);
+        
+        // If it's a meter event error, try with different payload format
+        if (stripeErr.response?.status === 400) {
+          console.log('🔄 [SYNC] Trying alternative meter event format...');
+          await sendMeterEventAlternative(mapping.stripe_customer_id, hours);
+        }
       }
     }
 
@@ -1627,6 +1646,40 @@ app.post('/jobs/sync-usage', async (req, res) => {
     res.status(500).json({ error: 'Sync job failed' });
   }
 });
+
+// ---------- Alternative Meter Event Function ----------
+
+async function sendMeterEventAlternative(customerId, hours) {
+  try {
+    console.log(`🔄 [ALTERNATIVE] Trying alternative meter event format for ${hours}h`);
+    
+    // Alternative 1: Simple customer_id format
+    const form = new URLSearchParams();
+    form.append('event_name', STRIPE_METER_EVENT_NAME);
+    form.append('payload[customer_id]', customerId);
+    form.append('payload[value]', hours.toFixed(2));
+
+    const response = await axios.post(
+      'https://api.stripe.com/v1/billing/meter_events',
+      form.toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        auth: {
+          username: process.env.STRIPE_SECRET_KEY,
+          password: '',
+        },
+      }
+    );
+
+    console.log('✅ [ALTERNATIVE] Success with alternative format');
+    return response.data;
+  } catch (err) {
+    console.error('❌ [ALTERNATIVE] Failed:', err.response?.data);
+    throw err;
+  }
+}
 
 // ---------- Manual fix endpoint for existing subscriptions ----------
 
@@ -1649,61 +1702,61 @@ app.post('/fix-subscription', async (req, res) => {
   }
 });
 
-// ========== MANUAL SYNC ENDPOINTS ==========
+// ========== REAL-TIME SYNC ENDPOINTS ==========
 
-// ---------- Debug endpoint to test time sync ----------
+// ---------- Real-time sync for single customer ----------
 
-app.post('/debug/test-sync', async (req, res) => {
-  console.log('\n🐛 [DEBUG-TEST] Testing time sync manually');
+app.post('/sync-customer', async (req, res) => {
+  console.log('\n⚡ [REAL-TIME] Real-time sync requested');
   
   if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
-    console.error('❌ [DEBUG-TEST] Unauthorized');
+    console.error('❌ [REAL-TIME] Unauthorized');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { project_id, hours, days = 30 } = req.body;
+  const { customer_id, hours } = req.body;
   
-  if (!project_id) {
-    return res.status(400).json({ error: 'Missing project_id' });
+  if (!customer_id) {
+    return res.status(400).json({ error: 'Missing customer_id' });
   }
 
   try {
-    console.log('🔧 [DEBUG-TEST] Manual sync test for project:', project_id);
+    console.log('🔧 [REAL-TIME] Syncing customer:', customer_id);
     
-    // Find the mapping for this project
+    // Find the mapping for this customer
     const mappings = await getAllMappings();
-    const mapping = mappings.find(m => m.toggl_project_id == project_id);
+    const mapping = mappings.find(m => m.stripe_customer_id === customer_id);
     
     if (!mapping) {
-      return res.status(404).json({ error: 'No mapping found for project ID' });
+      return res.status(404).json({ error: 'No mapping found for customer ID' });
     }
 
-    console.log('📋 [DEBUG-TEST] Found mapping:', {
+    console.log('📋 [REAL-TIME] Found mapping:', {
       company: mapping.company_name,
       customer: mapping.stripe_customer_id,
       project_id: mapping.toggl_project_id
     });
 
     const now = new Date();
-    const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    const since = mapping.last_synced_at || new Date(now.getTime() - 1 * 60 * 60 * 1000); // 1 hour
     
-    console.log(`⏰ [DEBUG-TEST] Sync range: ${since.toISOString()} to ${now.toISOString()}`);
+    console.log(`⏰ [REAL-TIME] Sync range: ${since.toISOString()} to ${now.toISOString()}`);
 
-    // If hours provided, use them directly (for testing)
+    // If hours provided, use them directly (for manual testing)
     let totalSeconds;
     if (hours) {
       totalSeconds = hours * 3600;
-      console.log(`🎯 [DEBUG-TEST] Using provided hours: ${hours} (${totalSeconds} seconds)`);
+      console.log(`🎯 [REAL-TIME] Using provided hours: ${hours} (${totalSeconds} seconds)`);
     } else {
-      // Fetch actual time from Toggl using FIXED function
-      totalSeconds = await fetchTogglBillableSecondsForProject(project_id, since, now);
+      // Fetch actual time from Toggl
+      totalSeconds = await fetchTogglBillableSecondsForProject(mapping.toggl_project_id, since, now);
     }
 
     const calculatedHours = totalSeconds / 3600;
-    console.log(`📈 [DEBUG-TEST] Hours to sync: ${calculatedHours.toFixed(2)}`);
+    console.log(`📈 [REAL-TIME] Hours to sync: ${calculatedHours.toFixed(2)}`);
 
     if (calculatedHours <= 0) {
-      console.log('⏭️ [DEBUG-TEST] No hours to sync');
+      console.log('⏭️ [REAL-TIME] No hours to sync');
       return res.json({ 
         success: true, 
         synced: false, 
@@ -1713,13 +1766,12 @@ app.post('/debug/test-sync', async (req, res) => {
     }
 
     // Send to Stripe
-    console.log(`📤 [DEBUG-TEST] Sending ${calculatedHours.toFixed(2)}h to Stripe...`);
+    console.log(`📤 [REAL-TIME] Sending ${calculatedHours.toFixed(2)}h to Stripe...`);
     
     const form = new URLSearchParams();
     form.append('event_name', STRIPE_METER_EVENT_NAME);
-    form.append('payload[stripe_customer_id]', mapping.stripe_customer_id);
+    form.append('payload[customer_id]', customer_id);
     form.append('payload[value]', calculatedHours.toFixed(2));
-    form.append('payload[project_id]', String(project_id));
 
     const stripeResponse = await axios.post(
       'https://api.stripe.com/v1/billing/meter_events',
@@ -1735,12 +1787,12 @@ app.post('/debug/test-sync', async (req, res) => {
       }
     );
 
-    console.log('✅ [DEBUG-TEST] Stripe API response:', stripeResponse.status);
+    console.log('✅ [REAL-TIME] Stripe API response:', stripeResponse.status);
 
     // Update last synced
     await updateLastSynced(mapping.stripe_subscription_id, now);
 
-    console.log(`✅ [DEBUG-TEST] Successfully synced ${calculatedHours.toFixed(2)}h`);
+    console.log(`✅ [REAL-TIME] Successfully synced ${calculatedHours.toFixed(2)}h`);
 
     res.json({
       success: true,
@@ -1752,11 +1804,89 @@ app.post('/debug/test-sync', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('❌ [DEBUG-TEST] Error:', err);
+    console.error('❌ [REAL-TIME] Error:', err);
     res.status(500).json({ 
       error: err.message,
       stripe_error: err.response?.data 
     });
+  }
+});
+
+// ---------- Debug endpoint to test meter events ----------
+
+app.post('/debug/meter-events', async (req, res) => {
+  console.log('\n🐛 [DEBUG-METER] Checking meter events');
+  
+  if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
+    console.error('❌ [DEBUG-METER] Unauthorized');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { customer_id = 'cus_TSRkPFKqd8TM00' } = req.body;
+
+  try {
+    // List recent meter events for a customer
+    const events = await stripe.billing.meterEvents.list({
+      limit: 10,
+      customer: customer_id
+    });
+    
+    console.log('📊 [DEBUG-METER] Recent meter events:', events.data);
+    
+    res.json({
+      events: events.data,
+      total: events.data.length
+    });
+  } catch (err) {
+    console.error('❌ [DEBUG-METER] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Test meter event submission ----------
+
+app.post('/test-meter-event', async (req, res) => {
+  console.log('\n🧪 [TEST-METER] Testing meter event submission');
+  
+  if (!USAGE_JOB_SECRET || req.query.secret !== USAGE_JOB_SECRET) {
+    console.error('❌ [TEST-METER] Unauthorized');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { customer_id, hours = 1, event_name = STRIPE_METER_EVENT_NAME } = req.body;
+  
+  if (!customer_id) {
+    return res.status(400).json({ error: 'Missing customer_id' });
+  }
+
+  try {
+    console.log(`🧪 [TEST-METER] Sending test event: ${hours}h for customer ${customer_id}`);
+    
+    const form = new URLSearchParams();
+    form.append('event_name', event_name);
+    form.append('payload[customer_id]', customer_id);
+    form.append('payload[value]', hours.toString());
+
+    const response = await axios.post(
+      'https://api.stripe.com/v1/billing/meter_events',
+      form.toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        auth: {
+          username: process.env.STRIPE_SECRET_KEY,
+          password: '',
+        },
+      }
+    );
+
+    console.log('✅ [TEST-METER] Success:', response.data);
+    res.json({ success: true, data: response.data });
+
+  } catch (err) {
+    console.error('❌ [TEST-METER] Error:', err.response?.data);
+    res.status(500).json({ error: err.response?.data });
   }
 });
 
@@ -1770,7 +1900,7 @@ app.post('/force-sync', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { days = 30 } = req.body; // Default to 30 days back
+  const { days = 1 } = req.body; // Default to 1 day back for real-time
 
   try {
     const mappings = await getAllMappings();
@@ -1785,6 +1915,11 @@ app.post('/force-sync', async (req, res) => {
 
     for (const mapping of mappings) {
       console.log(`\n🔍 [FORCE-SYNC] Processing: ${mapping.company_name}`);
+      
+      // Add delay between API calls
+      if (mappings.indexOf(mapping) > 0) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
       
       const totalSeconds = await fetchTogglBillableSecondsForProject(
         mapping.toggl_project_id,
@@ -1810,9 +1945,8 @@ app.post('/force-sync', async (req, res) => {
         
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id);
+        form.append('payload[customer_id]', mapping.stripe_customer_id);
         form.append('payload[value]', hours.toFixed(2));
-        form.append('payload[project_id]', String(mapping.toggl_project_id));
 
         await axios.post(
           'https://api.stripe.com/v1/billing/meter_events',
