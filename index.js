@@ -662,7 +662,7 @@ async function processSubscriptionWithCompanyName(subscriptionId, companyName) {
     console.log(`✅ [TOGGL] Client ID: ${togglClientId}`);
 
     console.log(`📋 [TOGGL] Creating Toggl project: "${planLabel}"`);
-    const togglProjectId = await findOrCreateTogglProject(togglClientId, planLabel);
+    const togglProjectId = await findOrCreateTogglProject(togglClientId, planLabel, companyName);
     console.log(`✅ [TOGGL] Project ID: ${togglProjectId}`);
 
     // TODOIST INTEGRATION
@@ -776,7 +776,7 @@ async function handleSubscriptionCreatedOrUpdated(subscription) {
     console.log(`✅ [TOGGL] Client ID: ${togglClientId}`);
 
     console.log(`📋 [TOGGL] Creating Toggl project: "${planLabel}"`);
-    const togglProjectId = await findOrCreateTogglProject(togglClientId, planLabel);
+    const togglProjectId = await findOrCreateTogglProject(togglClientId, planLabel, companyName);
     console.log(`✅ [TOGGL] Project ID: ${togglProjectId}`);
 
     // TODOIST INTEGRATION
@@ -848,30 +848,41 @@ async function findOrCreateTogglClient(companyName) {
   }
 }
 
-async function findOrCreateTogglProject(clientId, projectName) {
-  console.log(`\n🔍 [TOGGL-PROJECT] Finding/creating project: "${projectName}"`);
+async function findOrCreateTogglProject(clientId, projectName, companyName) {
+  console.log(`\n🔍 [TOGGL-PROJECT] Finding/creating project for company: "${companyName}"`);
   
   if (!TOGGL_WORKSPACE_ID) {
     throw new Error('TOGGL_WORKSPACE_ID is not set');
   }
 
+  // Make project name unique by including company name
+  const uniqueProjectName = `${companyName} - ${projectName}`;
+  console.log(`🏷️ [TOGGL-PROJECT] Using unique project name: "${uniqueProjectName}"`);
+
   try {
-    // Check if project already exists
     console.log('📡 [TOGGL-PROJECT] Fetching existing projects...');
     const res = await togglApi.get(`/workspaces/${TOGGL_WORKSPACE_ID}/projects`);
     
     console.log(`📊 [TOGGL-PROJECT] Found ${res.data?.length || 0} projects`);
     
-    const existing = res.data.find((p) => p.name === projectName);
+    // Look for project with the unique name
+    const existing = res.data.find((p) => p.name === uniqueProjectName);
     if (existing) {
       console.log(`✅ [TOGGL-PROJECT] Found existing project: ${existing.id} - "${existing.name}"`);
       return existing.id;
     }
 
-    // Create new project
-    console.log(`🚀 [TOGGL-PROJECT] Creating new project: "${projectName}"`);
+    // Also check if there's any project with same name but different client (legacy data)
+    const existingSameName = res.data.find((p) => p.name === projectName);
+    if (existingSameName) {
+      console.log(`⚠️ [TOGGL-PROJECT] Found legacy project with same name: ${existingSameName.id} - "${existingSameName.name}"`);
+      console.log(`🔄 [TOGGL-PROJECT] Will create new unique project instead`);
+    }
+
+    // Create new project with unique name
+    console.log(`🚀 [TOGGL-PROJECT] Creating new unique project: "${uniqueProjectName}"`);
     const payload = {
-      name: projectName,
+      name: uniqueProjectName,
       client_id: clientId,
       is_private: true,
       billable: true,
@@ -883,7 +894,7 @@ async function findOrCreateTogglProject(clientId, projectName) {
       payload
     );
     
-    console.log(`✅ [TOGGL-PROJECT] Created new project: ${createRes.data.id}`);
+    console.log(`✅ [TOGGL-PROJECT] Created new unique project: ${createRes.data.id}`);
     return createRes.data.id;
 
   } catch (err) {
