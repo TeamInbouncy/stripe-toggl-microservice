@@ -92,28 +92,28 @@ async function upsertCustomerMapping(mapping) {
       todoist_project_id,
       last_synced_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL)
-    ON CONFLICT (stripe_subscription_id) DO UPDATE
-      SET
-        stripe_customer_id = EXCLUDED.stripe_customer_id,
-        stripe_price_id    = EXCLUDED.stripe_price_id,
-        company_name       = EXCLUDED.company_name,
-        plan_label         = EXCLUDED.plan_label,
-        toggl_client_id    = EXCLUDED.toggl_client_id,
-        toggl_project_id   = EXCLUDED.toggl_project_id,
-        todoist_project_id = EXCLUDED.todoist_project_id,
-        updated_at         = NOW();
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+    ON CONFLICT (stripe_subscription_id) 
+    DO UPDATE SET
+      stripe_customer_id = EXCLUDED.stripe_customer_id,
+      stripe_price_id = EXCLUDED.stripe_price_id,
+      company_name = EXCLUDED.company_name,
+      plan_label = EXCLUDED.plan_label,
+      toggl_client_id = EXCLUDED.toggl_client_id,
+      toggl_project_id = EXCLUDED.toggl_project_id,
+      todoist_project_id = EXCLUDED.todoist_project_id,
+      updated_at = NOW()
   `;
 
   const params = [
     stripe_customer_id,
     stripe_subscription_id,
-    stripe_price_id,
+    stripe_price_id || null,
     company_name,
     plan_label,
-    toggl_client_id,
+    toggl_client_id || null,
     toggl_project_id,
-    todoist_project_id,
+    todoist_project_id || null,
   ];
 
   try {
@@ -121,6 +121,7 @@ async function upsertCustomerMapping(mapping) {
     console.log('✅ [DB] Successfully saved mapping to database');
   } catch (err) {
     console.error('❌ [DB] Error saving mapping:', err);
+    console.error('🔴 [DB] Error details:', err.message);
     throw err;
   }
 }
@@ -151,7 +152,7 @@ async function updateLastSynced(subscriptionId, date) {
       `
       UPDATE customer_mappings
          SET last_synced_at = $2,
-             updated_at     = NOW()
+             updated_at = NOW()
        WHERE stripe_subscription_id = $1
     `,
       [subscriptionId, date.toISOString()]

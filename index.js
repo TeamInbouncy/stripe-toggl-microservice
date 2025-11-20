@@ -937,7 +937,6 @@ app.get('/', (req, res) => {
   console.log('🏠 Health check request received');
   res.send('Stripe → Toggl → Todoist microservice is running');
 });
-
 (async () => {
   try {
     console.log('🚀 STARTING STRIPE → TOGGL → TODOIST MICROSERVICE ======================');
