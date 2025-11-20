@@ -549,15 +549,18 @@ async function handleCheckoutSessionCompleted(session) {
   }
   
   const customerId = session.customer;
-  if (!customerId) {
-    console.log('❌ [CHECKOUT] No customer ID found');
+  const subscriptionId = session.subscription;
+  
+  if (!customerId || !subscriptionId) {
+    console.log('❌ [CHECKOUT] Missing customer ID or subscription ID');
     return;
   }
 
   console.log('👤 [CHECKOUT] Customer ID:', customerId);
+  console.log('📝 [CHECKOUT] Subscription ID:', subscriptionId);
 
   try {
-    // Extract COMPANY NAME from custom fields - FIXED: Use company name, not card holder name
+    // Extract COMPANY NAME from custom fields
     let companyName = null;
     
     if (session.custom_fields && session.custom_fields.length > 0) {
@@ -584,12 +587,10 @@ async function handleCheckoutSessionCompleted(session) {
       }
     }
 
-    // IMPORTANT: DO NOT fallback to customer name (card holder name)
-    // We only want company name from custom fields
+    // IMPORTANT: If no company name found, we can't proceed
     if (!companyName) {
-      console.log('⚠️ [CHECKOUT] No company name found in custom fields');
-      console.log('ℹ️ [CHECKOUT] Will use customer metadata if available later');
-      return; // Don't update customer metadata if no company name found
+      console.log('❌ [CHECKOUT] No company name found in custom fields - cannot proceed');
+      return;
     }
 
     // Update customer metadata with COMPANY NAME
@@ -599,15 +600,103 @@ async function handleCheckoutSessionCompleted(session) {
     });
     console.log(`✅ [CHECKOUT] Updated customer metadata with company name`);
 
+    // NOW PROCESS THE SUBSCRIPTION WITH THE COMPANY NAME
+    console.log('🔄 [CHECKOUT] Now processing subscription with company name...');
+    await processSubscriptionWithCompanyName(subscriptionId, companyName);
+
   } catch (err) {
     console.error('❌ [CHECKOUT] Error:', err);
   }
 }
 
-// ---------- Subscription handler ----------
+// ---------- Process Subscription with Company Name ----------
+
+async function processSubscriptionWithCompanyName(subscriptionId, companyName) {
+  console.log('\n🎯 [SUBSCRIPTION-PROCESS] Processing subscription with company name');
+  console.log('📝 [SUBSCRIPTION-PROCESS] Subscription ID:', subscriptionId);
+  console.log('🏢 [SUBSCRIPTION-PROCESS] Company Name:', companyName);
+  
+  try {
+    // Retrieve the subscription
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    const customerId = subscription.customer;
+    const priceItem = subscription.items?.data?.[0]?.price;
+
+    if (!customerId || !priceItem) {
+      console.warn('❌ [SUBSCRIPTION-PROCESS] Missing customer or price');
+      return;
+    }
+
+    const priceId = priceItem.id;
+    console.log('💰 [SUBSCRIPTION-PROCESS] Price ID:', priceId);
+
+    // Fetch product data
+    console.log('📡 [SUBSCRIPTION-PROCESS] Fetching product data...');
+    const product = await stripe.products.retrieve(priceItem.product);
+    console.log('📦 [SUBSCRIPTION-PROCESS] Product name:', product.name);
+
+    // PLAN NAME EXTRACTION - from product name
+    let planName = 'Plan';
+    
+    // Extract from product name format: "Website Support | Lite Plan"
+    if (product.name) {
+      const productParts = product.name.split('|');
+      if (productParts[1]) {
+        planName = productParts[1].trim();
+        console.log(`✅ [SUBSCRIPTION-PROCESS] Extracted plan name: "${planName}"`);
+      } else {
+        planName = product.name.trim();
+        console.log(`⚠️ [SUBSCRIPTION-PROCESS] Using full product name: "${planName}"`);
+      }
+    }
+
+    // Clean plan label - REMOVE "(Unknown Plan)" 
+    const planLabel = `Website Support | ${planName}`.replace(/\(Unknown Plan\)/gi, '').trim();
+    console.log(`🏷️ [SUBSCRIPTION-PROCESS] Final plan label: "${planLabel}"`);
+
+    // TOGGL INTEGRATION - USING COMPANY NAME FOR CLIENT
+    console.log('\n🔧 [TOGGL] Starting Toggl integration...');
+    console.log(`🏢 [TOGGL] Creating Toggl client with COMPANY NAME: "${companyName}"`);
+    
+    const togglClientId = await findOrCreateTogglClient(companyName);
+    console.log(`✅ [TOGGL] Client ID: ${togglClientId}`);
+
+    console.log(`📋 [TOGGL] Creating Toggl project: "${planLabel}"`);
+    const togglProjectId = await findOrCreateTogglProject(togglClientId, planLabel);
+    console.log(`✅ [TOGGL] Project ID: ${togglProjectId}`);
+
+    // TODOIST INTEGRATION
+    console.log('\n🔧 [TODOIST] Starting Todoist integration...');
+    const todoistProjectName = `${companyName} – ${planLabel}`;
+    console.log(`📋 [TODOIST] Creating project: "${todoistProjectName}"`);
+    
+    const todoistProjectId = await findOrCreateTodoistProject(todoistProjectName);
+    console.log(`✅ [TODOIST] Project ID: ${todoistProjectId}`);
+
+    // SAVE TO DATABASE
+    console.log('\n💾 [DATABASE] Saving mapping...');
+    await upsertCustomerMapping({
+      stripe_customer_id: customerId,
+      stripe_subscription_id: subscriptionId,
+      stripe_price_id: priceId,
+      company_name: companyName,
+      plan_label: planLabel,
+      toggl_client_id: togglClientId,
+      toggl_project_id: togglProjectId,
+      todoist_project_id: todoistProjectId,
+    });
+
+    console.log(`✅ [SUBSCRIPTION-PROCESS] Completed for COMPANY: "${companyName}" with PLAN: "${planLabel}"`);
+
+  } catch (err) {
+    console.error('❌ [SUBSCRIPTION-PROCESS] Error:', err);
+  }
+}
+
+// ---------- Subscription handler (for existing subscriptions) ----------
 
 async function handleSubscriptionCreatedOrUpdated(subscription) {
-  console.log('\n🎯 [SUBSCRIPTION] Handling subscription');
+  console.log('\n🎯 [SUBSCRIPTION] Handling subscription (existing)');
   console.log('📝 [SUBSCRIPTION] ID:', subscription.id);
   console.log('👤 [SUBSCRIPTION] Customer:', subscription.customer);
   
@@ -638,7 +727,7 @@ async function handleSubscriptionCreatedOrUpdated(subscription) {
 
     console.log('📦 [SUBSCRIPTION] Product name:', product.name);
 
-    // COMPANY NAME EXTRACTION WITH STRICT PRIORITY - USE COMPANY NAME ONLY
+    // COMPANY NAME EXTRACTION - for existing subscriptions
     let companyName = null;
     
     // Priority 1: customer.metadata.company_name (from checkout custom field)
@@ -651,7 +740,6 @@ async function handleSubscriptionCreatedOrUpdated(subscription) {
       companyName = subscription.metadata.company_name;
       console.log(`✅ [SUBSCRIPTION] Using COMPANY NAME from subscription metadata: "${companyName}"`);
     }
-    // DO NOT use customer.name (card holder name) as fallback
     // If no company name found, we can't proceed
     else {
       console.log('❌ [SUBSCRIPTION] No company name found in metadata');
@@ -1009,6 +1097,27 @@ app.post('/jobs/sync-usage', async (req, res) => {
   } catch (err) {
     console.error('❌ [SYNC] Job failed:', err);
     res.status(500).json({ error: 'Sync job failed' });
+  }
+});
+
+// ---------- Manual fix endpoint for existing subscriptions ----------
+
+app.post('/fix-subscription', async (req, res) => {
+  console.log('\n🔧 [MANUAL-FIX] Manual subscription fix requested');
+  
+  const { subscription_id, company_name } = req.body;
+  
+  if (!subscription_id || !company_name) {
+    return res.status(400).json({ error: 'Missing subscription_id or company_name' });
+  }
+
+  try {
+    console.log(`🔧 [MANUAL-FIX] Fixing subscription ${subscription_id} with company name: ${company_name}`);
+    await processSubscriptionWithCompanyName(subscription_id, company_name);
+    res.json({ success: true, message: 'Subscription processed successfully' });
+  } catch (err) {
+    console.error('❌ [MANUAL-FIX] Error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
