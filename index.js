@@ -661,10 +661,9 @@ app.post('/jobs/sync-usage', async (req, res) => {
       try {
         console.log(`📤 [SYNC] Sending ${hours.toFixed(2)}h to Stripe...`);
         
-        // ✅ CRITICAL FIX: Use 'customer_id' instead of 'stripe_customer_id'
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[customer_id]', mapping.stripe_customer_id); // FIXED
+        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id); // FIXED
         form.append('payload[value]', hours.toFixed(2));
         form.append('timestamp', Math.floor(now.getTime() / 1000)); // ADDED
 
@@ -699,8 +698,7 @@ app.post('/jobs/sync-usage', async (req, res) => {
         // Update last synced timestamp
         await updateLastSynced(mapping.stripe_subscription_id, now);
 
-        console.log(`✅ [SYNC] Successfully synce
-d ${hours.toFixed(2)}h for: ${mapping.company_name}`);
+        console.log(`✅ [SYNC] Successfully synced ${hours.toFixed(2)}h for: ${mapping.company_name}`);
         syncedCount += 1;
         
         results.push({
@@ -773,18 +771,18 @@ app.post('/sync-customer', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { customer_id, hours } = req.body;
+  const { stripe_customer_id, hours } = req.body;
   
-  if (!customer_id) {
-    return res.status(400).json({ error: 'Missing customer_id' });
+  if (!stripe_customer_id) {
+    return res.status(400).json({ error: 'Missing stripe_customer_id' });
   }
 
   try {
-    console.log('🔧 [REAL-TIME] Syncing customer:', customer_id);
+    console.log('🔧 [REAL-TIME] Syncing customer:', stripe_customer_id);
     
     // Find the mapping for this customer
     const mappings = await getAllMappings();
-    const mapping = mappings.find(m => m.stripe_customer_id === customer_id);
+    const mapping = mappings.find(m => m.stripe_customer_id === stripe_customer_id);
     
     if (!mapping) {
       return res.status(404).json({ error: 'No mapping found for customer ID' });
@@ -827,14 +825,13 @@ app.post('/sync-customer', async (req, res) => {
     // Send to Stripe
     console.log(`📤 [REAL-TIME] Sending ${calculatedHours.toFixed(2)}h to Stripe...`);
     
-    // ✅ CRITICAL FIX: Use 'customer_id' instead of 'stripe_customer_id'
     const form = new URLSearchParams();
     form.append('event_name', STRIPE_METER_EVENT_NAME);
-    form.append('payload[customer_id]', customer_id); // FIXED
+    form.append('payload[stripe_customer_id]', stripe_customer_id); // FIXED
     form.append('payload[value]', calculatedHours.toFixed(2));
     form.append('timestamp', Math.floor(now.getTime() / 1000)); // ADDED
 
-    const idempotencyKey = `manual-${customer_id}-${Math.floor(now.getTime() / 1000)}`;
+    const idempotencyKey = `manual-${stripe_customer_id}-${Math.floor(now.getTime() / 1000)}`;
 
     const stripeResponse = await axios.post(
       'https://api.stripe.com/v1/billing/meter_events',
@@ -886,23 +883,22 @@ app.post('/test-meter-event', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { customer_id, hours = 1, event_name = STRIPE_METER_EVENT_NAME } = req.body;
+  const { stripe_customer_id, hours = 1, event_name = STRIPE_METER_EVENT_NAME } = req.body;
   
-  if (!customer_id) {
-    return res.status(400).json({ error: 'Missing customer_id' });
+  if (!stripe_customer_id) {
+    return res.status(400).json({ error: 'Missing stripe_customer_id' });
   }
 
   try {
-    console.log(`🧪 [TEST-METER] Sending test event: ${hours}h for customer ${customer_id}`);
+    console.log(`🧪 [TEST-METER] Sending test event: ${hours}h for customer ${stripe_customer_id}`);
     
-    // ✅ CRITICAL FIX: Use 'customer_id' instead of 'stripe_customer_id'
     const form = new URLSearchParams();
     form.append('event_name', event_name);
-    form.append('payload[customer_id]', customer_id); // FIXED
+    form.append('payload[stripe_customer_id]', stripe_customer_id); // FIXED
     form.append('payload[value]', hours.toString());
     form.append('timestamp', Math.floor(Date.now() / 1000)); // ADDED
 
-    const idempotencyKey = `test-${customer_id}-${Date.now()}`;
+    const idempotencyKey = `test-${stripe_customer_id}-${Date.now()}`;
 
     const response = await axios.post(
       'https://api.stripe.com/v1/billing/meter_events',
@@ -1057,10 +1053,10 @@ app.post('/force-sync', async (req, res) => {
       try {
         console.log(`📤 [FORCE-SYNC] Sending ${hours.toFixed(2)}h to Stripe...`);
         
-        // ✅ CRITICAL FIX: Use 'customer_id' instead of 'stripe_customer_id'
+        
         const form = new URLSearchParams();
         form.append('event_name', STRIPE_METER_EVENT_NAME);
-        form.append('payload[customer_id]', mapping.stripe_customer_id); // FIXED
+        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id); // FIXED
         form.append('payload[value]', hours.toFixed(2));
         form.append('timestamp', Math.floor(now.getTime() / 1000)); // ADDED
 
