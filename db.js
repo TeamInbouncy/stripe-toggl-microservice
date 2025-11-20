@@ -153,7 +153,7 @@ const pool = new Pool({
 async function initDb() {
   if (!connectionString) return;
 
-  console.log('🔧 INITIALIZING DATABASE ======================');
+  console.log('🔧 [DB] Initializing database...');
   
   const createSql = `
     CREATE TABLE IF NOT EXISTS customer_mappings (
@@ -180,75 +180,25 @@ async function initDb() {
 
   try {
     await pool.query(createSql);
-    console.log('✅ customer_mappings table ready');
-    
-    // Check and add missing columns
-    const requiredColumns = [
-      'stripe_price_id',
-      'company_name', 
-      'plan_label',
-      'toggl_client_id',
-      'toggl_project_id',
-      'todoist_project_id',
-      'last_synced_at',
-      'created_at',
-      'updated_at'
-    ];
-
-    console.log('🔍 Checking for missing columns...');
-    
-    for (const column of requiredColumns) {
-      const checkColumnSql = `
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name='customer_mappings' AND column_name=$1;
-      `;
-      
-      const columnCheck = await pool.query(checkColumnSql, [column]);
-      if (columnCheck.rows.length === 0) {
-        console.log(`🔧 Adding missing column: ${column}`);
-        
-        let alterSql;
-        switch(column) {
-          case 'toggl_client_id':
-          case 'toggl_project_id':
-            alterSql = `ALTER TABLE customer_mappings ADD COLUMN ${column} BIGINT`;
-            break;
-          case 'last_synced_at':
-          case 'created_at':
-          case 'updated_at':
-            alterSql = `ALTER TABLE customer_mappings ADD COLUMN ${column} TIMESTAMPTZ`;
-            if (column === 'created_at' || column === 'updated_at') {
-              alterSql += ' DEFAULT NOW()';
-            }
-            break;
-          default:
-            alterSql = `ALTER TABLE customer_mappings ADD COLUMN ${column} TEXT`;
-        }
-        
-        await pool.query(alterSql);
-        console.log(`✅ Added column: ${column}`);
-      } else {
-        console.log(`✅ Column exists: ${column}`);
-      }
-    }
-    
-    console.log('✅ Database schema check complete');
-    console.log('🔧 DATABASE INITIALIZATION COMPLETE ======================\n');
-    
+    console.log('✅ [DB] customer_mappings table ready');
   } catch (err) {
-    console.error('❌ Error initializing database:', err);
+    console.error('❌ [DB] Error creating table:', err);
   }
 }
 
 async function upsertCustomerMapping(mapping) {
   if (!connectionString) {
-    console.log('⚠️ No database connection - skipping mapping upsert');
+    console.log('⚠️ [DB] No database connection - skipping mapping upsert');
     return;
   }
 
-  console.log('💾 DATABASE SAVE OPERATION ======================');
-  
+  console.log('💾 [DB] Saving mapping to database:', {
+    stripe_customer_id: mapping.stripe_customer_id,
+    stripe_subscription_id: mapping.stripe_subscription_id,
+    company_name: mapping.company_name,
+    plan_label: mapping.plan_label
+  });
+
   const {
     stripe_customer_id,
     stripe_subscription_id,
@@ -259,17 +209,6 @@ async function upsertCustomerMapping(mapping) {
     toggl_project_id,
     todoist_project_id,
   } = mapping;
-
-  console.log('📦 Data to save:', {
-    stripe_customer_id,
-    stripe_subscription_id,
-    stripe_price_id,
-    company_name,
-    plan_label,
-    toggl_client_id,
-    toggl_project_id,
-    todoist_project_id
-  });
 
   const sql = `
     INSERT INTO customer_mappings (
@@ -308,53 +247,34 @@ async function upsertCustomerMapping(mapping) {
   ];
 
   try {
-    const result = await pool.query(sql, params);
-    console.log('✅ Successfully saved mapping to database');
-    console.log('💾 DATABASE SAVE COMPLETE ======================\n');
-    return result;
+    await pool.query(sql, params);
+    console.log('✅ [DB] Successfully saved mapping to database');
   } catch (err) {
-    console.error('❌ Database error saving mapping:', err);
-    console.error('💾 DATABASE SAVE FAILED ======================\n');
+    console.error('❌ [DB] Error saving mapping:', err);
     throw err;
   }
 }
 
 async function getAllMappings() {
   if (!connectionString) {
-    console.log('⚠️ No database connection - returning empty mappings');
+    console.log('⚠️ [DB] No database connection - returning empty mappings');
     return [];
   }
-  
-  console.log('📊 FETCHING ALL MAPPINGS FROM DATABASE ======================');
   
   try {
     const res = await pool.query(
       'SELECT * FROM customer_mappings ORDER BY id ASC'
     );
-    console.log(`✅ Retrieved ${res.rows.length} mappings from database`);
-    
-    if (res.rows.length > 0) {
-      console.log('📋 Mappings found:');
-      res.rows.forEach((mapping, index) => {
-        console.log(`  ${index + 1}. ${mapping.company_name} - ${mapping.plan_label} (Toggl Project: ${mapping.toggl_project_id})`);
-      });
-    }
-    
-    console.log('📊 DATABASE FETCH COMPLETE ======================\n');
+    console.log(`📊 [DB] Retrieved ${res.rows.length} mappings from database`);
     return res.rows;
   } catch (err) {
-    console.error('❌ Database error getting mappings:', err);
-    console.log('📊 DATABASE FETCH FAILED ======================\n');
+    console.error('❌ [DB] Error getting mappings:', err);
     return [];
   }
 }
 
 async function updateLastSynced(subscriptionId, date) {
   if (!connectionString) return;
-
-  console.log('🕒 UPDATING LAST SYNCED TIME ======================');
-  console.log('📝 Subscription ID:', subscriptionId);
-  console.log('⏰ Sync time:', date.toISOString());
 
   try {
     await pool.query(
@@ -366,11 +286,9 @@ async function updateLastSynced(subscriptionId, date) {
     `,
       [subscriptionId, date.toISOString()]
     );
-    console.log('✅ Updated last_synced for subscription');
-    console.log('🕒 LAST SYNCED UPDATE COMPLETE ======================\n');
+    console.log(`✅ [DB] Updated last_synced for subscription: ${subscriptionId}`);
   } catch (err) {
-    console.error('❌ Database error updating last_synced:', err);
-    console.log('🕒 LAST SYNCED UPDATE FAILED ======================\n');
+    console.error('❌ [DB] Error updating last_synced:', err);
   }
 }
 
