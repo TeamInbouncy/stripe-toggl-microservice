@@ -525,25 +525,103 @@ app.use(bodyParser.json());
 
 // ---------- Checkout Session Handler ----------
 
+// async function handleCheckoutSessionCompleted(session) {
+//   if (session.mode !== 'subscription') return;
+  
+//   const customerId = session.customer;
+//   if (!customerId) return;
+
+//   try {
+//     // Extract company name from custom fields - try multiple possible field names
+//     let companyName = null;
+//     if (session.custom_fields && session.custom_fields.length > 0) {
+//       const possibleFieldNames = ['company_name', 'company', 'business_name', 'business', 'organization', 'org_name'];
+      
+//       for (const field of session.custom_fields) {
+//         const fieldKey = field.key?.toLowerCase();
+//         const fieldLabel = field.label?.toLowerCase();
+        
+//         // Check if field matches any of our possible names
+//         const isCompanyField = possibleFieldNames.some(name => 
+//           fieldKey?.includes(name) || fieldLabel?.includes(name)
+//         );
+        
+//         if (isCompanyField && field.text && field.text.value) {
+//           companyName = field.text.value;
+//           console.log(`✅ Found company name from field "${field.key}": ${companyName}`);
+//           break;
+//         }
+//       }
+      
+//       // If still not found, try to get the first custom text field
+//       if (!companyName) {
+//         const firstTextField = session.custom_fields.find(field => 
+//           field.text && field.text.value
+//         );
+//         if (firstTextField) {
+//           companyName = firstTextField.text.value;
+//           console.log(`⚠️ Using first custom field "${firstTextField.key}" as company name: ${companyName}`);
+//         }
+//       }
+//     }
+
+//     // Fallback to customer name if no company name found
+//     if (!companyName && session.customer_details && session.customer_details.name) {
+//       companyName = session.customer_details.name;
+//       console.log(`ℹ️ Using customer name as company name: ${companyName}`);
+//     }
+
+//     // If we found company name, update customer metadata
+//     if (companyName) {
+//       await stripe.customers.update(customerId, {
+//         metadata: { company_name: companyName }
+//       });
+//       console.log(`✅ Updated company name for customer ${customerId}: ${companyName}`);
+//     } else {
+//       console.log(`⚠️ No company name found in custom fields for customer ${customerId}`);
+//     }
+//   } catch (err) {
+//     console.error('❌ Error handling checkout.session.completed', err);
+//   }
+// }
+// ---------- Checkout Session Handler ----------
+
 async function handleCheckoutSessionCompleted(session) {
-  if (session.mode !== 'subscription') return;
+  console.log('\n🛒 HANDLING CHECKOUT SESSION COMPLETED ==========');
+  console.log('📋 Session ID:', session.id);
+  console.log('🔧 Session mode:', session.mode);
+  
+  if (session.mode !== 'subscription') {
+    console.log('⏭️ Not a subscription session - skipping');
+    return;
+  }
   
   const customerId = session.customer;
-  if (!customerId) return;
+  if (!customerId) {
+    console.log('❌ No customer ID found in session');
+    return;
+  }
+
+  console.log('👤 Customer ID:', customerId);
 
   try {
-    // Extract company name from custom fields - try multiple possible field names
+    // Extract company name from custom fields - FIXED VERSION
     let companyName = null;
+    
     if (session.custom_fields && session.custom_fields.length > 0) {
+      console.log('🔍 Checking custom fields for company name...');
+      
       const possibleFieldNames = ['company_name', 'company', 'business_name', 'business', 'organization', 'org_name'];
       
       for (const field of session.custom_fields) {
-        const fieldKey = field.key?.toLowerCase();
-        const fieldLabel = field.label?.toLowerCase();
+        const fieldKey = field.key ? String(field.key).toLowerCase() : '';
+        const fieldLabel = field.label ? String(field.label).toLowerCase() : '';
+        
+        console.log(`   Checking field: key="${field.key}", label="${field.label}"`);
         
         // Check if field matches any of our possible names
         const isCompanyField = possibleFieldNames.some(name => 
-          fieldKey?.includes(name) || fieldLabel?.includes(name)
+          fieldKey.includes(name) || fieldLabel.includes(name)
         );
         
         if (isCompanyField && field.text && field.text.value) {
@@ -563,6 +641,8 @@ async function handleCheckoutSessionCompleted(session) {
           console.log(`⚠️ Using first custom field "${firstTextField.key}" as company name: ${companyName}`);
         }
       }
+    } else {
+      console.log('📋 No custom fields found in session');
     }
 
     // Fallback to customer name if no company name found
@@ -571,20 +651,28 @@ async function handleCheckoutSessionCompleted(session) {
       console.log(`ℹ️ Using customer name as company name: ${companyName}`);
     }
 
+    // Final fallback
+    if (!companyName) {
+      companyName = 'Unknown Company';
+      console.log(`⚠️ No company name found, using default: ${companyName}`);
+    }
+
     // If we found company name, update customer metadata
-    if (companyName) {
+    if (companyName && companyName !== 'Unknown Company') {
       await stripe.customers.update(customerId, {
         metadata: { company_name: companyName }
       });
       console.log(`✅ Updated company name for customer ${customerId}: ${companyName}`);
     } else {
-      console.log(`⚠️ No company name found in custom fields for customer ${customerId}`);
+      console.log(`ℹ️ No company name to update for customer ${customerId}`);
     }
   } catch (err) {
     console.error('❌ Error handling checkout.session.completed', err);
+    console.error('Error stack:', err.stack);
   }
+  
+  console.log('🛒 CHECKOUT SESSION HANDLING COMPLETE ==========\n');
 }
-
 // ---------- Subscription handler ----------
 
 async function handleSubscriptionCreatedOrUpdated(subscription) {
