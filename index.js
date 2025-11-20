@@ -1,4 +1,3 @@
-// index.js
 require('dotenv').config();
 
 const express = require('express');
@@ -67,6 +66,9 @@ app.post(
 
     try {
       switch (event.type) {
+        case 'checkout.session.completed':
+          await handleCheckoutSessionCompleted(event.data.object);
+          break;
         case 'customer.subscription.created':
         case 'customer.subscription.updated':
           await handleSubscriptionCreatedOrUpdated(event.data.object);
@@ -87,6 +89,68 @@ app.post(
 // All other routes: normal JSON body
 app.use(bodyParser.json());
 
+// ---------- Checkout Session Handler ----------
+
+async function handleCheckoutSessionCompleted(session) {
+  if (session.mode !== 'subscription') return;
+  
+  const customerId = session.customer;
+  if (!customerId) return;
+
+  try {
+    // Extract company name from custom fields - try multiple possible field names
+    let companyName = null;
+    if (session.custom_fields && session.custom_fields.length > 0) {
+      const possibleFieldNames = ['company_name', 'company', 'business_name', 'business', 'organization', 'org_name'];
+      
+      for (const field of session.custom_fields) {
+        const fieldKey = field.key?.toLowerCase();
+        const fieldLabel = field.label?.toLowerCase();
+        
+        // Check if field matches any of our possible names
+        const isCompanyField = possibleFieldNames.some(name => 
+          fieldKey?.includes(name) || fieldLabel?.includes(name)
+        );
+        
+        if (isCompanyField && field.text && field.text.value) {
+          companyName = field.text.value;
+          console.log(`✅ Found company name from field "${field.key}": ${companyName}`);
+          break;
+        }
+      }
+      
+      // If still not found, try to get the first custom text field
+      if (!companyName) {
+        const firstTextField = session.custom_fields.find(field => 
+          field.text && field.text.value
+        );
+        if (firstTextField) {
+          companyName = firstTextField.text.value;
+          console.log(`⚠️ Using first custom field "${firstTextField.key}" as company name: ${companyName}`);
+        }
+      }
+    }
+
+    // Fallback to customer name if no company name found
+    if (!companyName && session.customer_details && session.customer_details.name) {
+      companyName = session.customer_details.name;
+      console.log(`ℹ️ Using customer name as company name: ${companyName}`);
+    }
+
+    // If we found company name, update customer metadata
+    if (companyName) {
+      await stripe.customers.update(customerId, {
+        metadata: { company_name: companyName }
+      });
+      console.log(`✅ Updated company name for customer ${customerId}: ${companyName}`);
+    } else {
+      console.log(`⚠️ No company name found in custom fields for customer ${customerId}`);
+    }
+  } catch (err) {
+    console.error('❌ Error handling checkout.session.completed', err);
+  }
+}
+
 // ---------- Subscription handler ----------
 
 async function handleSubscriptionCreatedOrUpdated(subscription) {
@@ -106,7 +170,7 @@ async function handleSubscriptionCreatedOrUpdated(subscription) {
     stripe.products.retrieve(priceItem.product),
   ]);
 
-  // Prefer company name from metadata, then fallback
+  // Improved company name extraction with better priority
   const companyName =
     (customer.metadata && customer.metadata.company_name) ||
     (subscription.metadata && subscription.metadata.company_name) ||
@@ -114,26 +178,28 @@ async function handleSubscriptionCreatedOrUpdated(subscription) {
     customer.email ||
     'Unknown Customer';
 
-  const productName = product.name || 'Website Support';
-  const planName =
-    priceItem.nickname ||
-    (priceItem.metadata && priceItem.metadata.plan_name) ||
-    'Unknown Plan';
+  // Extract product name and plan name from the full product name
+  const fullProductName = product.name || 'Website Support | Plan';
+  
+  // Split the product name to get base product and plan
+  const productParts = fullProductName.split('|');
+  const productName = productParts[0]?.trim() || 'Website Support';
+  const planName = productParts[1]?.trim() || 'Plan';
 
-  const planLabel = `${productName} (${planName})`;
+  // Clean plan label without "Unknown Plan"
+  const planLabel = `${productName} | ${planName}`.replace(/\(Unknown Plan\)/gi, '').trim();
+
+  console.log(`📝 Product Analysis - Full: "${fullProductName}", Product: "${productName}", Plan: "${planName}"`);
 
   const togglClientId = await findOrCreateTogglClient(companyName);
   const togglProjectId = await findOrCreateTogglProject(
     togglClientId,
-    companyName,
-    productName,
-    planName
+    planLabel
   );
-  const todoistProjectId = await findOrCreateTodoistProject(
-    companyName,
-    productName,
-    planName
-  );
+  
+  // Todoist project name should be "Company Name – Product Name"
+  const todoistProjectName = `${companyName} – ${planLabel}`;
+  const todoistProjectId = await findOrCreateTodoistProject(todoistProjectName);
 
   await upsertCustomerMapping({
     stripe_customer_id: customerId,
@@ -180,17 +246,10 @@ async function findOrCreateTogglClient(clientName) {
   return createRes.data.id;
 }
 
-async function findOrCreateTogglProject(
-  clientId,
-  companyName,
-  productName,
-  planName
-) {
+async function findOrCreateTogglProject(clientId, projectName) {
   if (!TOGGL_WORKSPACE_ID) {
     throw new Error('TOGGL_WORKSPACE_ID is not set');
   }
-
-  const projectName = `${companyName} – ${productName} (${planName})`;
 
   try {
     const res = await togglApi.get(
@@ -225,34 +284,36 @@ async function fetchTogglBillableSecondsForProject(projectId, since, until) {
     end_date: until.toISOString(),
   };
 
-  const res = await togglApi.get('/me/time_entries', { params });
+  try {
+    const res = await togglApi.get('/me/time_entries', { params });
 
-  const entries = res.data || [];
-  let totalSeconds = 0;
+    const entries = res.data || [];
+    let totalSeconds = 0;
 
-  entries.forEach((e) => {
-    if (
-      e.project_id === projectId &&
-      e.billable &&
-      typeof e.duration === 'number' &&
-      e.duration > 0
-    ) {
-      totalSeconds += e.duration;
-    }
-  });
+    console.log(`   📊 Found ${entries.length} total time entries in Toggl`);
 
-  return totalSeconds;
+    entries.forEach((e) => {
+      if (
+        e.project_id === projectId &&
+        e.billable &&
+        typeof e.duration === 'number' &&
+        e.duration > 0
+      ) {
+        totalSeconds += e.duration;
+        console.log(`   ✅ Counting entry: ${e.description} - ${e.duration} seconds`);
+      }
+    });
+
+    return totalSeconds;
+  } catch (err) {
+    console.error('Error fetching Toggl time entries', err.response?.data || err);
+    return 0;
+  }
 }
 
 // ---------- Todoist helpers ----------
 
-async function findOrCreateTodoistProject(
-  companyName,
-  productName,
-  planName
-) {
-  const projectName = `${companyName} – ${productName} (${planName})`;
-
+async function findOrCreateTodoistProject(projectName) {
   try {
     const res = await todoistApi.get('/projects');
     const existing = res.data.find((p) => p.name === projectName);
@@ -286,10 +347,16 @@ app.post('/jobs/sync-usage', async (req, res) => {
     const now = new Date();
     let syncedCount = 0;
 
+    console.log(`🕒 Starting sync job for ${mappings.length} mappings`);
+
     for (const mapping of mappings) {
       const since =
         mapping.last_synced_at ||
-        new Date(now.getTime() - 24 * 60 * 60 * 1000); // default: last 24h
+        new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+      console.log(`🔍 Checking project ${mapping.toggl_project_id} for customer ${mapping.stripe_customer_id}`);
+      console.log(`   Company: ${mapping.company_name}, Plan: ${mapping.plan_label}`);
+      console.log(`   Time range: ${since.toISOString()} to ${now.toISOString()}`);
 
       const totalSeconds = await fetchTogglBillableSecondsForProject(
         mapping.toggl_project_id,
@@ -299,42 +366,48 @@ app.post('/jobs/sync-usage', async (req, res) => {
 
       const hours = totalSeconds / 3600;
 
+      console.log(`   Found ${totalSeconds} seconds (${hours.toFixed(2)} hours) for project ${mapping.toggl_project_id}`);
+
       if (hours <= 0) {
+        console.log(`   ⏭️  No hours to sync for project ${mapping.toggl_project_id}`);
         continue;
       }
 
-      const form = new URLSearchParams();
-      form.append('event_name', STRIPE_METER_EVENT_NAME);
-      form.append('payload[stripe_customer_id]', mapping.stripe_customer_id);
-      form.append('payload[value]', hours.toFixed(2));
-      form.append('payload[project_id]', String(mapping.toggl_project_id));
+      try {
+        const form = new URLSearchParams();
+        form.append('event_name', STRIPE_METER_EVENT_NAME);
+        form.append('payload[stripe_customer_id]', mapping.stripe_customer_id);
+        form.append('payload[value]', hours.toFixed(2));
+        form.append('payload[project_id]', String(mapping.toggl_project_id));
 
-      await axios.post(
-        'https://api.stripe.com/v1/billing/meter_events',
-        form.toString(),
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          auth: {
-            username: process.env.STRIPE_SECRET_KEY,
-            password: '',
-          },
-        }
-      );
+        console.log(`   📤 Sending ${hours.toFixed(2)}h to Stripe for customer ${mapping.stripe_customer_id}`);
 
-      await updateLastSynced(mapping.stripe_subscription_id, now);
+        await axios.post(
+          'https://api.stripe.com/v1/billing/meter_events',
+          form.toString(),
+          {
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            auth: {
+              username: process.env.STRIPE_SECRET_KEY,
+              password: '',
+            },
+          }
+        );
 
-      console.log(
-        `✅ Sent ${hours.toFixed(
-          2
-        )}h for customer ${mapping.stripe_customer_id} (project ${
-          mapping.toggl_project_id
-        })`
-      );
-      syncedCount += 1;
+        await updateLastSynced(mapping.stripe_subscription_id, now);
+
+        console.log(
+          `✅ Successfully sent ${hours.toFixed(2)}h for customer ${mapping.stripe_customer_id}`
+        );
+        syncedCount += 1;
+      } catch (stripeErr) {
+        console.error(`❌ Stripe API error for customer ${mapping.stripe_customer_id}:`, stripeErr.response?.data || stripeErr.message);
+      }
     }
 
+    console.log(`✅ Sync job completed. Synced ${syncedCount} customers`);
     res.json({ status: 'ok', synced: syncedCount });
   } catch (err) {
     console.error('❌ Error in sync-usage job', err);
